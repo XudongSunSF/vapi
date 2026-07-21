@@ -17,14 +17,14 @@ extern "C" {
  * When a non-empty modelMapCsv is supplied, the behavioral model-map spec is
  * parsed and its native handle is created internally; it is NOT returned to the
  * caller and must NOT be tracked in the caller's handle stack. That internal
- * spec handle is owned by the returned model-session and is released
- * automatically when the session handle is passed to deleteHandle. There is no
- * separate destroy entry point for it.
+ * spec handle is owned by the returned model-config handle and is released
+ * automatically when the model-config handle is passed to deleteHandle. There is
+ * no separate destroy entry point for it.
  *
- * @return a model-session handle, or NullHandle on failure with the per-thread
+ * @return a model-config handle, or NullHandle on failure with the per-thread
  *         error indicator set (e.g. when the CSV or parameters fail to parse).
  */
-WFMCM_API Handle WFMCM_CALLCONV createModelSession(
+WFMCM_API Handle WFMCM_CALLCONV createModelConfig(
     const char* modelParams,
     int modelParamsLen,
     const char* modelMapCsv,
@@ -43,7 +43,7 @@ WFMCM_API Handle WFMCM_CALLCONV createModelSession(
  * Production callers MUST use createRequestContextFromHandles instead.
  */
 WFMCM_API Handle WFMCM_CALLCONV createRequestContext(
-    Handle modelSession,
+    Handle modelConfig,
     const char* historicalData,
     int historicalDataLen,
     const char* marketData,
@@ -55,7 +55,7 @@ WFMCM_API Handle WFMCM_CALLCONV createRequestContext(
  * @param marketData May be NullHandle for behavioral-only contexts.
  */
 WFMCM_API Handle WFMCM_CALLCONV createRequestContextFromHandles(
-    Handle modelSession,
+    Handle modelConfig,
     Handle historicalData,
     Handle dateSpec,
     Handle modelOptions,
