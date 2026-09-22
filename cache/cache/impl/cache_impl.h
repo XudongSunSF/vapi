@@ -37,8 +37,8 @@ inline
 cache::~cache()
 {
 	terminate_ = true;
-	sizePolicyCond_.notify_one();
-	ttlPolicyCond_.notify_one();
+	sizePolicyCond_.notify_all();
+	ttlPolicyCond_.notify_all();
 	for (auto&& t : pruningThreads_) {
 		if (t.joinable()) t.join();
 	}
@@ -128,6 +128,7 @@ size_t cache::do_prune(const Policy& policy) noexcept
 	}
 	catch (...) {}
 	isPruning_.clear();
+	pruningCond_.notify_all();
 	return num;
 }
 
@@ -276,11 +277,32 @@ inline
 void cache::size_pruning() noexcept
 {
 	latch_.count_down();
-	while (1) {
-		std::unique_lock<std::mutex> lock(sizePolicyMutex_);
-		sizePolicyCond_.wait(lock);
-		if (terminate_) break;
-		do_prune(sizePolicy_);
+	while (true) {
+		size_t generation = 0;
+		{
+			std::unique_lock<std::mutex> lock(sizePolicyMutex_);
+			sizePolicyCond_.wait(lock, [this]()->bool {
+				return terminate_ || sizePruneRequested_ != sizePruneCompleted_;
+			});
+			if (terminate_) break;
+			generation = sizePruneRequested_;
+		}
+
+		// Drain the cache back under its cap. A burst of concurrent inserts can
+		// require more than one batched prune; stop if a pass makes no progress
+		// (e.g. the removal percentage rounds to zero or every candidate is
+		// still in-flight).
+		while (opts_.maxNumElements_ && do_size() > *opts_.maxNumElements_) {
+			const size_t before = do_size();
+			do_prune(sizePolicy_);
+			if (do_size() >= before) break;
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(sizePolicyMutex_);
+			sizePruneCompleted_ = generation;
+		}
+		sizePolicyCond_.notify_all();
 		stripeStats_.sizePruneLastRun_ = std::chrono::system_clock::now();
 		++stripeStats_.sizePruneNumRuns_;
 	}
@@ -295,15 +317,28 @@ bool cache::do_is_prune_operation_running() const noexcept
 inline
 void cache::do_wait_until_prune_finishes() const noexcept
 {
-	std::shared_lock<std::shared_mutex> lock(pruningMutex_);
-	pruningCond_.wait(lock, [this]()->bool { return !isPruning_.test(); });
+	// Wait for any in-flight prune (size or TTL) to finish.
+	{
+		std::shared_lock<std::shared_mutex> lock(pruningMutex_);
+		pruningCond_.wait(lock, [this]()->bool { return !isPruning_.test(); });
+	}
+	// Then wait until the asynchronous size pruner has acknowledged every
+	// pending request (i.e. the cache has been drained back under its cap).
+	std::unique_lock<std::mutex> lock(sizePolicyMutex_);
+	sizePolicyCond_.wait(lock, [this]()->bool {
+		return terminate_ || sizePruneRequested_ == sizePruneCompleted_;
+	});
 }
 
 inline
 void cache::check_max_elements() const noexcept
 {
 	if (opts_.maxNumElements_ && (do_size_unsafe() > opts_.maxNumElements_)) {
-		sizePolicyCond_.notify_one();
+		{
+			std::lock_guard<std::mutex> lock(sizePolicyMutex_);
+			++sizePruneRequested_;
+		}
+		sizePolicyCond_.notify_all();
 	}
 }
 

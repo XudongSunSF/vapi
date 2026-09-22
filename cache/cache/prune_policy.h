@@ -172,65 +172,6 @@ namespace wf::mortgage::utility::containers
 		std::optional<double> percentage_;
 	};
 
-	/**
-	 * @brief Prune policy implementing least-recently-used (LRU) eviction.
-	 *
-	 * Entries are ordered by their last-access time and the `N` least recently
-	 * used entries are selected for pruning. Because the cache refreshes an
-	 * entry's last-access time on every successful read or write, applying this
-	 * policy to the cache turns it into an LRU cache.
-	 *
-	 * `N` is specified either as an exact number of entries or as a percentage
-	 * of the current cache size.
-	*/
-	template <typename Key>
-	struct lru_prune_policy : public prune_policy_interface<Key, lru_prune_policy<Key>>
-	{
-		using base_type = prune_policy_interface<Key, lru_prune_policy<Key>>;
-		using key_type = Key;
-		struct exact{};
-		struct percentage{};
-
-		lru_prune_policy(exact, size_t value)
-			: numElements_(value)
-		{}
-
-		lru_prune_policy(percentage, double value)
-			: percentage_(value)
-		{}
-
-	private:
-		friend base_type;
-
-		template <std::ranges::view V>
-		std::pmr::vector<prune_element<key_type>>
-		do_prune(std::pmr::memory_resource* res, const V& cacheView) const noexcept
-		{
-			try {
-				size_t numItemsToRemove = numElements_.value_or(0);
-				size_t viewSize = std::distance(cacheView.begin(), cacheView.end());
-				if (percentage_) numItemsToRemove = static_cast<size_t>((double)viewSize * percentage_.value() / 100);
-				numItemsToRemove = std::min(numItemsToRemove, viewSize);
-
-				//sort by least recently used (oldest last-access time first)
-				//and keep only the first numItemsToRemove entries
-				std::pmr::vector<prune_element<key_type>> vec(numItemsToRemove, res);
-				auto last = std::partial_sort_copy(cacheView.begin(), cacheView.end(), vec.begin(), vec.end(),
-					[](const prune_element<key_type>& lhs, const prune_element<key_type>& rhs)->bool {
-						return *lhs.desc_ < *rhs.desc_;
-					});
-				vec.resize(static_cast<size_t>(std::distance(vec.begin(), last)));
-
-				return vec;
-			}
-			catch (...) {}
-			return {};
-		}
-
-		std::optional<size_t> numElements_;
-		std::optional<double> percentage_;
-	};
-
 } //namespace 
 
 #endif

@@ -1,6 +1,7 @@
 #ifndef WF_MORTGAGE_UTILITY_CONTAINERS_CACHE_H
 #define WF_MORTGAGE_UTILITY_CONTAINERS_CACHE_H
 
+#include <atomic>
 #include <latch>
 #include <thread>
 
@@ -104,13 +105,16 @@ protected:
 	//prune related members
 	std::latch latch_;
 	std::pmr::vector<std::thread> pruningThreads_;
-	bool terminate_{ false };
+	std::atomic<bool> terminate_{ false };
 	time_to_live_prune_policy<key_type> ttlPolicy_;
 	mutable std::mutex ttlPolicyMutex_;
 	mutable std::condition_variable ttlPolicyCond_;
 	size_restriction_prune_policy<key_type> sizePolicy_;
 	mutable std::mutex sizePolicyMutex_;
 	mutable std::condition_variable sizePolicyCond_;
+	// Pending vs completed size-prune requests. Guarded by sizePolicyMutex_.
+	mutable size_t sizePruneRequested_{ 0 };
+	mutable size_t sizePruneCompleted_{ 0 };
 	mutable std::shared_mutex pruningMutex_;
 	mutable std::condition_variable_any pruningCond_;
 	mutable std::atomic_flag isPruning_{};

@@ -9,6 +9,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 
@@ -64,6 +65,9 @@ struct cache_stripe : public cache_reader_interface<cache_key, cache_stripe>,
 		std::condition_variable cv_;
 		bool done_{ false };
 		std::exception_ptr error_;
+		// Thread that is creating the value; used to detect a reentrant same-key
+		// build on the same thread (which would otherwise wait on itself).
+		std::thread::id leaderId_{};
 	};
 
 	using in_flight_map = std::pmr::unordered_map<key_type, std::shared_ptr<in_flight>>;
@@ -300,7 +304,7 @@ cache_stripe::do_read_or_insert(
 {
 	assert(f);
 
-	// Current cache behavior: every thread that misses the cache invokes the
+	// Concurrent cache behavior: every thread that misses the cache invokes the
 	// creator function independently. The first insertion for a key wins.
 	if (coordinationPolicy_ == build_coordination_policy::concurrent) {
 		auto ptr = do_read<T>(k);
@@ -333,10 +337,20 @@ cache_stripe::do_read_or_insert(
 				flight = std::allocate_shared<in_flight>(
 					std::pmr::polymorphic_allocator<in_flight>(&res_)
 				);
+				flight->leaderId_ = std::this_thread::get_id();
 				it->second = flight;
 			}
 			else {
 				flight = it->second;
+				// A creator that re-enters read_or_insert for the same key on the
+				// same thread would block waiting on its own in-flight build. Fail
+				// fast instead of deadlocking.
+				if (flight->leaderId_ == std::this_thread::get_id()) {
+					THROW_EX(
+						InvalidStateException,
+						"cache: reentrant single-flight build for the same key on the "
+						"same thread would deadlock");
+				}
 			}
 		}
 
