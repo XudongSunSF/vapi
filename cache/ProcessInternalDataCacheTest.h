@@ -226,8 +226,8 @@ BOOST_AUTO_TEST_CASE(capacity_evicts_least_recently_used)
     BOOST_CHECK_EQUAL(buildCount.load(), 2);
 
     // Build entries 3, 4, 5. Exceeds capacity (4); triggers async eviction.
-    // LRU order before insert 5: [2, 3, 4, 1] (2 is least recent, 1 is most recent)
-    // Insert 5, size becomes 5; evict 25% (≈1 entry): evict 2.
+    // Last-access order before insert 5: [2, 1, 3, 4] (2 least recent, 4 most recent).
+    // Insert 5, size becomes 5; evict 25% (1 entry): evict 2.
     // After eviction: [1, 3, 4, 5], size = 4
     cache.getOrBuild(3, make(3)); // buildCount = 3
     cache.getOrBuild(4, make(4)); // buildCount = 4
@@ -247,11 +247,16 @@ BOOST_AUTO_TEST_CASE(capacity_evicts_least_recently_used)
 BOOST_AUTO_TEST_CASE(evicted_value_stays_alive_while_handle_is_held)
 {
     MarkerCache cache(4); // soft capacity of 4
-    auto h1 = cache.getOrBuild(1, [] { return Marker{11}; });
+    std::atomic buildCount{0};
+    auto h1 = cache.getOrBuild(1, [&buildCount] {
+        buildCount.fetch_add(1, std::memory_order_relaxed);
+        return Marker{11};
+    });
     const Marker* p1 = &h1.get();
+    BOOST_CHECK_EQUAL(buildCount.load(), 1);
 
-    // Build entries 2, 3, 4, 5. After inserting 5, size exceeds cap; evict LRU (entry 2).
-    // Entry 1 is most recently accessed, so it's not evicted.
+    // Build entries 2, 3, 4, 5. After inserting 5, size exceeds the cap and the
+    // least-recently-used entry (1, built first and never re-accessed) is evicted.
     cache.getOrBuild(2, [] { return Marker{22}; });
     cache.getOrBuild(3, [] { return Marker{33}; });
     cache.getOrBuild(4, [] { return Marker{44}; });
@@ -259,11 +264,18 @@ BOOST_AUTO_TEST_CASE(evicted_value_stays_alive_while_handle_is_held)
     cache.waitForPruning(); // wait for async eviction to complete
     BOOST_CHECK_EQUAL(cache.size(), 4u);
 
-    // The handle h1 still owns entry 1, even though it may no longer be in the cache.
-    // (Entry 1 is the most recent access, so it stays in the cache, but this test
-    // verifies the handle keeps the value alive even after eviction.)
+    // Entry 1 was evicted, but the caller's handle keeps the value alive.
     BOOST_CHECK(&h1.get() == p1);
     BOOST_CHECK_EQUAL(h1.get().value, 11);
+
+    // Requesting 1 again rebuilds it, proving the cache entry was actually evicted.
+    auto h1Again = cache.getOrBuild(1, [&buildCount] {
+        buildCount.fetch_add(1, std::memory_order_relaxed);
+        return Marker{12};
+    });
+    BOOST_CHECK_EQUAL(buildCount.load(), 2);
+    BOOST_CHECK_EQUAL(h1Again.get().value, 12);
+    BOOST_CHECK(&h1Again.get() != &h1.get());
 }
 
 BOOST_AUTO_TEST_CASE(default_cache_uses_large_default_capacity)
@@ -275,16 +287,14 @@ BOOST_AUTO_TEST_CASE(default_cache_uses_large_default_capacity)
     BOOST_CHECK_EQUAL(cache.size(), 100u); // well under the default cap, nothing evicted
 }
 
-// The eviction scan runs on insert while over capacity. If the least-recently-used
-// entry is still in-flight it must be skipped without stalling the scan; this test
-// keeps such an entry in-flight while a second insert triggers eviction, and would
-// hang if evictLruIfNeeded() failed to make progress past an in-flight entry.
-BOOST_AUTO_TEST_CASE(eviction_scan_does_not_hang_when_lru_entry_is_in_flight)
+// A single-flight build for one key must not block builds for other keys:
+// while key 1 is in-flight, key 2 can still be built and returned.
+BOOST_AUTO_TEST_CASE(in_flight_build_does_not_block_other_keys)
 {
-    MarkerCache cache(1); // capacity of one makes the second insert attempt eviction
+    MarkerCache cache;
 
-    std::latch key1Building(1); // released once key1's build has started (its LRU node exists, unresolved)
-    std::latch releaseKey1(1);  // key1's build blocks here so it stays in-flight during the second insert
+    std::latch key1Building(1); // released once key1's build has started
+    std::latch releaseKey1(1);  // key1's build blocks here so it stays in-flight
 
     std::jthread worker([&cache, &key1Building, &releaseKey1] {
         cache.getOrBuild(1, [&key1Building, &releaseKey1] {
@@ -294,15 +304,15 @@ BOOST_AUTO_TEST_CASE(eviction_scan_does_not_hang_when_lru_entry_is_in_flight)
         });
     });
 
-    key1Building.wait(); // ensure key1 is in-flight before inserting key2
+    key1Building.wait(); // ensure key1 is in-flight before building key2
 
-    // key1 is the in-flight least-recently-used entry; this insert runs the eviction
-    // scan over it and must return rather than spin.
     auto h2 = cache.getOrBuild(2, [] { return Marker{2}; });
     BOOST_CHECK_EQUAL(h2.get().value, 2);
 
     releaseKey1.count_down();
     worker.join();
+
+    BOOST_CHECK_EQUAL(cache.size(), 2u);
 }
 
 #ifndef NDEBUG
