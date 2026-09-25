@@ -29,7 +29,7 @@ using wf::mortgage::utility::store;
 
 namespace {
 
-using ModelSessionDataT = app::vasara::ModelSessionData;
+using ModelConfigDataT = app::vasara::ModelConfigData;
 using RequestContextDataT = app::vasara::RequestContextData;
 using RequestContextBytesT = app::vasara::RequestContextBytes;
 using RequestContextHandlesT = app::vasara::RequestContextHandles;
@@ -48,7 +48,7 @@ struct PricingRequestInputs {
     Handle dateSpec{NullHandle};
     Handle modelOptions{NullHandle};
     Handle marketData{NullHandle};
-    std::shared_ptr<const ModelSessionDataT> modelSession;
+    std::shared_ptr<const ModelConfigDataT> modelConfig;
 };
 
 std::vector<char> copyBytes(const char* data, int len)
@@ -87,7 +87,7 @@ std::string previewPayload(
 }
 
 
-// NOTE: an earlier revision kept a file-local modelSession -> requestContext
+// NOTE: an earlier revision kept a file-local modelConfig -> requestContext
 // registry here. It was write-only (registered on create, never consulted,
 // never unregistered -- generic deleteHandle cannot see file-local state), so
 // it grew without bound and accumulated stale Handle keys. It has been
@@ -151,17 +151,22 @@ void logVasaraDebug(const std::string& msg)
     std::clog << "[WfmcmVasaraApi] " << msg << '\n';
 }
 
-// Shared RAII owner for the internal behavioral-model-map spec handle.
-//
-// The spec handle is created natively inside createModelSession and is never
-// returned to the Java side, so it is NOT in Java's handle-teardown stack and
-// nothing external will ever delete it. Ownership therefore lives with the
-// ModelSessionData (and every request-context copy of it) via a shared_ptr
-// whose deleter removes the handle when the last owner goes away -- i.e. when
-// the session handle is deleted after all dependent contexts (Java's LIFO
-// teardown guarantees contexts go first). The deleter tolerates teardown
-// ordering: if the HandleContainer is already gone, the spec's HandleData was
-// destroyed with it and there is nothing left to delete.
+/**
+ * Shared RAII owner for the internal behavioral-model-map spec handle.
+ *
+ * The spec handle is created natively inside createModelConfig and is never
+ * returned to the Java side, so it is NOT in Java's handle-teardown stack and
+ * nothing external will ever delete it. Ownership therefore lives with the
+ * ModelConfigData (and every request-context copy of it) via a shared_ptr
+ * whose deleter removes the handle when the last owner goes away -- i.e. when
+ * the session handle is deleted after all dependent contexts (Java's LIFO
+ * teardown guarantees contexts go first). The deleter tolerates teardown
+ * ordering: if the HandleContainer is already gone, the spec's HandleData was
+ * destroyed with it and there is nothing left to delete.
+ *
+ * @param h The spec handle to own. May be NullHandle for a session with no
+ *          behavioral map.
+ */
 std::shared_ptr<const Handle> makeOwnedSpecHandle(Handle h)
 {
     if (h == NullHandle) {
@@ -179,13 +184,17 @@ std::shared_ptr<const Handle> makeOwnedSpecHandle(Handle h)
         });
 }
 
-// Builds the behavioral model map spec from CSV bytes.
-// - Empty CSV is a legitimate "no behavioral map" session: returns NullHandle
-//   with *err left as success.
-// - Any FAILURE (spec creation or parameter set) is reported through *err so
-//   createModelSession can fail loudly. Silently proceeding without the map
-//   would skip mapBehavioralModel in the calc paths and produce wrong
-//   valuations with no error indication -- the worst failure mode available.
+/**
+ *  Builds the behavioral model map spec from CSV bytes.
+ * - Empty CSV is a legitimate "no behavioral map" session: returns NullHandle
+ *   with *err left as success.
+ * - Any FAILURE (spec creation or parameter set) is reported through *err so
+ *   createModelConfig can fail loudly. Silently proceeding without the map
+ *   would skip mapBehavioralModel in the calc paths and produce wrong
+ *   valuations with no error indication -- the worst failure mode available.
+ *  @param csv The CSV bytes to parse.
+ *  @param err Out param for any failure. Cleared on success.
+ */
 Handle createBehavioralModelMapSpecFromCsv(const std::vector<char>& csv, HandleError* err)
 {
     *err = HandleError{};
@@ -443,13 +452,13 @@ app::messages::CalcBehavioralSpeedFromPrimaryRateRequest& out)
         return {ApiErrorOperationNotSupported, "Failed to create instrument portfolio"};
     }
 
-    if (ctx.modelSession_ && ctx.modelSession_->modelMapSpecHandle() != NullHandle) {
+    if (ctx.modelConfig_ && ctx.modelConfig_->modelMapSpecHandle() != NullHandle) {
         const QuantLib::Date qlFactor = dateSpec.getMarketCurveDate();
         const Date factorDate{
             static_cast<unsigned int>(QuantLib::toYYYYMMDD(qlFactor))};
         const int mapRc = mapBehavioralModel(
             portfolio,
-            ctx.modelSession_->modelMapSpecHandle(),
+            ctx.modelConfig_->modelMapSpecHandle(),
             factorDate);
         if (mapRc != ApiSuccess) {
             // mapBehavioralModel sets its error on either the portfolio or the
@@ -657,18 +666,18 @@ HandleError buildPricingRequestFromContext(
         return {ApiErrorOperationNotSupported, "Failed to create instrument portfolio"};
     }
 
-    if (in.modelSession && in.modelSession->modelMapSpecHandle() != NullHandle) {
+    if (in.modelConfig && in.modelConfig->modelMapSpecHandle() != NullHandle) {
         if (debug) {
             logVasaraDebug(std::format(
                 "calcValueForInstrument applying behavioral model map handle={}",
-                in.modelSession->modelMapSpecHandle().internal_));
+                in.modelConfig->modelMapSpecHandle().internal_));
         }
         const Handle dateSpecH = in.dateSpec;
         READ_LOCK_HANDLE(dateSpecH);
         const auto& dateSpec = handleObject<HandleType::DateSpec>(dateSpecH);
         const QuantLib::Date qlFactor = dateSpec.getMarketCurveDate();
         const Date factorDate{ static_cast<unsigned int>(QuantLib::toYYYYMMDD(qlFactor)) };
-        if (mapBehavioralModel(portfolio, in.modelSession->modelMapSpecHandle(), factorDate) != ApiSuccess) {
+        if (mapBehavioralModel(portfolio, in.modelConfig->modelMapSpecHandle(), factorDate) != ApiSuccess) {
             return handleErrFromHandle(portfolio, "mapBehavioralModel failed");
         }
     }
@@ -686,7 +695,7 @@ HandleError buildPricingRequestFromContext(
 
 } // namespace
 
-Handle createModelSession(
+Handle createModelConfig(
     const char* modelParams,
     int modelParamsLen,
     const char* modelMapCsv,
@@ -696,23 +705,23 @@ Handle createModelSession(
 
     CHECK_INIT2;
 
-    ModelSessionDataT session{
+    ModelConfigDataT config{
         copyBytes(modelParams, modelParamsLen),
         copyBytes(modelMapCsv, modelMapCsvLen)};
 
     HandleError specErr;
     const Handle spec =
-        createBehavioralModelMapSpecFromCsv(session.modelMapCsv_, &specErr);
+        createBehavioralModelMapSpecFromCsv(config.modelMapCsv_, &specErr);
     if (specErr.isError()) {
         RETURN_ERROR(NullHandle, specErr.error_, specErr.reason_, NullHandle);
     }
     // From here the shared owner guarantees the spec handle is released even
     // if make_shared / addHandleData throws below.
-    session.modelMapSpec_ = makeOwnedSpecHandle(spec);
+    config.modelMapSpec_ = makeOwnedSpecHandle(spec);
 
     auto hd = std::make_shared<app::HandleData>(
-        HandleType::ModelSessionData,
-        std::move(session));
+        HandleType::ModelConfigData,
+        std::move(config));
 
     Handle h = handles->addHandleData(std::move(hd));
     RETURN_SUCCESS(h, h);
@@ -721,7 +730,7 @@ Handle createModelSession(
 }
 
 Handle createRequestContext(
-    Handle modelSession,
+    Handle modelConfig,
     const char* historicalData,
     int historicalDataLen,
     const char* marketData,
@@ -731,7 +740,7 @@ Handle createRequestContext(
     TRY
 
     CHECK_INIT2;
-    CHECK_HANDLE2(NullHandle, modelSession, HandleType::ModelSessionData);
+    CHECK_HANDLE2(NullHandle, modelConfig, HandleType::ModelConfigData);
 
     // Bytes variant is reserved for future cross-JVM / Grid distribution.
     // DTO parsing is not yet wired, so non-empty payloads cannot be honored.
@@ -740,19 +749,19 @@ Handle createRequestContext(
     if ((historicalData != nullptr && historicalDataLen > 0)
         || (marketData != nullptr && marketDataLen > 0)) {
         RETURN_ERROR(
-            modelSession,
+            modelConfig,
             ApiErrorOperationNotSupported,
             "createRequestContext (bytes variant) does not yet support "
             "non-empty payloads; use createRequestContextFromHandles",
             NullHandle);
     }
 
-    READ_LOCK_HANDLE(modelSession);
-    auto& modelObj = handleObject<HandleType::ModelSessionData>(modelSession);
-    auto modelCopy = std::make_shared<const ModelSessionDataT>(modelObj);
+    READ_LOCK_HANDLE(modelConfig);
+    auto& modelObj = handleObject<HandleType::ModelConfigData>(modelConfig);
+    auto modelCopy = std::make_shared<const ModelConfigDataT>(modelObj);
 
     RequestContextDataT ctx{
-        modelSession,
+        modelConfig,
         modelCopy,
         RequestContextBytesT{
             copyBytes(historicalData, historicalDataLen),
@@ -770,7 +779,7 @@ Handle createRequestContext(
 }
 
 Handle createRequestContextFromHandles(
-    Handle modelSession,
+    Handle modelConfig,
     Handle historicalData,
     Handle dateSpec,
     Handle modelOptions,
@@ -779,7 +788,7 @@ Handle createRequestContextFromHandles(
     TRY
 
     CHECK_INIT2;
-    CHECK_HANDLE2(NullHandle, modelSession, HandleType::ModelSessionData);
+    CHECK_HANDLE2(NullHandle, modelConfig, HandleType::ModelConfigData);
     CHECK_HANDLE2(NullHandle, historicalData, HandleType::HistoricalData);
     CHECK_HANDLE2(NullHandle, dateSpec, HandleType::DateSpec);
     CHECK_HANDLE2(NullHandle, modelOptions, HandleType::ModelOptions);
@@ -788,12 +797,12 @@ Handle createRequestContextFromHandles(
         CHECK_HANDLE2(NullHandle, marketData, HandleType::MarketData);
     }
 
-    READ_LOCK_HANDLE(modelSession);
-    auto& modelObj = handleObject<HandleType::ModelSessionData>(modelSession);
-    auto modelCopy = std::make_shared<const ModelSessionDataT>(modelObj);
+    READ_LOCK_HANDLE(modelConfig);
+    auto& modelObj = handleObject<HandleType::ModelConfigData>(modelConfig);
+    auto modelCopy = std::make_shared<const ModelConfigDataT>(modelObj);
 
     RequestContextDataT ctx{
-        modelSession,
+        modelConfig,
         modelCopy,
         RequestContextHandlesT{
             historicalData,
@@ -946,7 +955,7 @@ const char* calcValueForInstrument(
         inputs.dateSpec = ctxHandles->dateSpecHandle_;
         inputs.modelOptions = ctxHandles->modelOptionsHandle_;
         inputs.marketData = ctxHandles->marketDataHandle_;
-        inputs.modelSession = ctx.modelSession_;
+        inputs.modelConfig = ctx.modelConfig_;
     }
 
     app::ScopedHandle request;
@@ -1064,7 +1073,7 @@ Handle calcValueForInstrumentObj(
         inputs.dateSpec = ctxHandles->dateSpecHandle_;
         inputs.modelOptions = ctxHandles->modelOptionsHandle_;
         inputs.marketData = ctxHandles->marketDataHandle_;
-        inputs.modelSession = ctx.modelSession_;
+        inputs.modelConfig = ctx.modelConfig_;
     }
 
     app::ScopedHandle request;
@@ -1108,7 +1117,11 @@ int resultIsError(Handle resultData)
 {
     TRY
 
-    CHECK_INIT;
+    if (!handles) {
+        //Do not use CHECK_INIT here: it returns the ApiErrorLibSetup enum value,
+        //which callers of this predicate would misread as "result is an error".
+        RETURN_ERROR(NullHandle, ApiErrorLibSetup, "Library not initialized", 0);
+    }
     CHECK_HANDLE2(0, resultData, HandleType::ResultData);
     READ_LOCK_HANDLE(resultData);
     return handleObject<HandleType::ResultData>(resultData).response_.isErrorResponse() ? 1 : 0;
@@ -1139,7 +1152,9 @@ double resultGetCleanPrice(Handle resultData)
 {
     TRY
 
-    CHECK_INIT;
+    if (!handles) {
+        RETURN_ERROR(NullHandle, ApiErrorLibSetup, "Library not initialized", 0.0);
+    }
     CHECK_HANDLE2(0.0, resultData, HandleType::ResultData);
     READ_LOCK_HANDLE(resultData);
     const auto& response = handleObject<HandleType::ResultData>(resultData).response_;
@@ -1160,7 +1175,9 @@ double resultGetHolding(Handle resultData)
 {
     TRY
 
-    CHECK_INIT;
+    if (!handles) {
+        RETURN_ERROR(NullHandle, ApiErrorLibSetup, "Library not initialized", 0.0);
+    }
     CHECK_HANDLE2(0.0, resultData, HandleType::ResultData);
     READ_LOCK_HANDLE(resultData);
     const auto& response = handleObject<HandleType::ResultData>(resultData).response_;
@@ -1174,7 +1191,9 @@ double resultGetOas(Handle resultData)
 {
     TRY
 
-    CHECK_INIT;
+    if (!handles) {
+        RETURN_ERROR(NullHandle, ApiErrorLibSetup, "Library not initialized", 0.0);
+    }
     CHECK_HANDLE2(0.0, resultData, HandleType::ResultData);
     READ_LOCK_HANDLE(resultData);
     const auto& response = handleObject<HandleType::ResultData>(resultData).response_;
@@ -1208,7 +1227,11 @@ int resultGetSettleDate(Handle resultData)
 {
     TRY
 
-    CHECK_INIT;
+    if (!handles) {
+        //CHECK_INIT would return ApiErrorLibSetup, which is a plausible YYYYMMDD-domain
+        //int for callers expecting "0 when unset".
+        RETURN_ERROR(NullHandle, ApiErrorLibSetup, "Library not initialized", 0);
+    }
     CHECK_HANDLE2(0, resultData, HandleType::ResultData);
     READ_LOCK_HANDLE(resultData);
     const auto& response = handleObject<HandleType::ResultData>(resultData).response_;
