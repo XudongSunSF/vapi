@@ -411,7 +411,7 @@ graph LR
 
 Downstream suites `GreeksSuite` and `WaterfallSuite` declare `MortgageValuationSuite` as a dependency and read its intermediates, matching the existing valuation entry points (`CalcGreeksFromPricesRequestHandler`, `AttribValueChangeByWaterfallRequestHandler`). `ProfitabilitySuite` is the exception: it consumes precomputed behavioral speeds (its own whole-loan cashflow engine), not the valuation suites' discount/cashflow intermediates — `CalcProfitabilityFromBehavioralSpeedsRequestHandler` therefore depends on `BehavioralSuite`, not `MortgageValuationSuite`.
 
-> **Horizon scenarios:** horizon analysis (PolyPaths-style re-anchoring, subscribed vs realized rate
+> **Horizon scenarios:** horizon analysis (PolyPaths-style re-anchoring, prescribed vs realized rate
 > paths) is a rate-generation concern — see `RateGenerationModelSuiteRedesign.md` §6B. Horizon paths
 > arrive here via `intermediate["rates"]["horizon/..."]` and are consumed like any other scenario;
 > these suites need no horizon-specific changes.

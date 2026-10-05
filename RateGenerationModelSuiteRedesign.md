@@ -15,7 +15,7 @@ cp**Target framework:** New layered architecture with Presentation, Application,
 - [5. Proposed Request Model](#5-proposed-request-model)
 - [6. Portfolio-Driven Rate Requirements Inference](#6-portfolio-driven-rate-requirements-inference)
 - [6A. Driving / Basis / Discount Index Selection (Treasury Basis)](#6a-driving--basis--discount-index-selection-treasury-basis)
-- [6B. Horizon Scenario Analysis (Subscribed vs Realized Rate Paths)](#6b-horizon-scenario-analysis-subscribed-vs-realized-rate-paths)
+- [6B. Horizon Scenario Analysis (Prescribed vs Realized Rate Paths)](#6b-horizon-scenario-analysis-prescribed-vs-realized-rate-paths)
 - [7. Proposed Data Access Layer Changes](#7-proposed-data-access-layer-changes)
 - [8. Workflow Orchestrator Changes](#8-workflow-orchestrator-changes)
 - [9. `RateGenSuiteExecutor` Design](#9-rategensuiteexecutor-design)
@@ -887,7 +887,7 @@ index concept consistent between the native `RateGenSuite` path and the PolyPath
 
 ---
 
-## 6B. Horizon Scenario Analysis (Subscribed vs Realized Rate Paths)
+## 6B. Horizon Scenario Analysis (Prescribed vs Realized Rate Paths)
 
 ### 6B.1 Purpose
 
@@ -911,10 +911,15 @@ segment** of the path:
 
 | Mode | Anchor segment `[base, horizon]` | Forward segment `(horizon, end]` | Bridge / API mapping |
 |---|---|---|---|
-| **Subscribed (scenario) horizon rates** | **User-supplied** (embedded, file, or scenario-derived) | Model-projected from the horizon | `FileBased`/`ScnBased`; `ApiHorizonScenarioType::Prescribed`/`Filebased` |
+| **Prescribed (scenario) horizon rates** | **User-supplied** (embedded, file, or scenario-derived) | Model-projected from the horizon | `FileBased`/`ScnBased`; `ApiHorizonScenarioType::Prescribed`/`Filebased` |
 | **Realized horizon rate paths** | **Model-projected** (driving-index model from the base date) | Model-projected (continuous) | `RealizedFwd`; `ApiHorizonScenarioType::Forward` |
 
-1. **Subscribed (scenario) horizon rates.** The caller provides the rate path up to the horizon
+> **Terminology:** "prescribed" is the same concept as `RateGenerationSpec::prescribed_` (§5.1)
+> and `ApiHorizonScenarioType::Prescribed` — user-supplied rates instead of model-generated.
+> ("Subscribed rates" is a synonym used in the valuation/PolyPaths domain; this doc uses
+> "prescribed" to stay consistent with the spec field and the API enum.)
+
+1. **Prescribed (scenario) horizon rates.** The caller provides the rate path up to the horizon
    period ("subscribed rates"); `RateGenSuite` projects only the future segment beyond the horizon.
    This is a *segment-prescribed* variant of `RateGenerationSpec::prescribed_` (Section 5.1): instead
    of prescribing the whole path, the prescribed set covers `[base, horizon]` and the projector runs
@@ -938,14 +943,14 @@ Extend `RateGenerationSpec` (Section 5.1) with an optional horizon block:
 ```cpp
 struct HorizonGenerationSpec {
     // Which form the horizon rate path takes (Section 6B.2).
-    enum class RateSource { Subscribed, Realized };
+    enum class RateSource { Prescribed, Realized };
     RateSource rateSource = RateSource::Realized;
 
     app::messages::DateSpec horizonDateSpec_;   // horizon date + factor/market dates
     int horizonMonths_ = 0;                     // projection length measured from the horizon
 
-    // Subscribed only: source for the [base, horizon] rate-path segment.
-    std::optional<RateSource> subscribedHorizonRates_;
+    // Prescribed only: source for the [base, horizon] rate-path segment.
+    std::optional<RateSource> prescribedHorizonRates_;
 
     // When true, basis/PSS market snapshots are recalibrated at the horizon date
     // (the PolyPaths per-Bond ccBondCalibration_ / prBondCalibration_ analog).
@@ -958,25 +963,93 @@ std::optional<HorizonGenerationSpec> horizon_;
 
 ### 6B.4 Re-Anchored Calibration (`HorizonMarketSnapshotBuilder`)
 
-The one genuinely new domain component is the horizon re-anchor. At the horizon date it:
+The one genuinely new domain component is the horizon re-anchor: at the horizon date, the basis
+(secondary) and PSS (primary) market snapshots are **recalibrated to the horizon market state**
+before the forward projection. This replaces the bridge's per-`Bond` calibration maps —
+`ccBondCalibration_` (`map<MortgageRateType, BasisSnapshot>`, i.e. unexpected basis) and
+`prBondCalibration_` (`map<PrimaryRateType, BasisSnapshot>`) — and the per-`Run` caches
+`horizonSecondRateCalibCache_` / `horizonPrimaryRateCalibCache_`
+([ppbridge](.github/pando_context/pando_context/modules/ppbridge.md)).
 
-1. rebuilds the market snapshot (swap rates, swaption vol, HPI/unemployment) **as of the horizon**;
-2. builds secondary/primary model sessions anchored at the horizon (the basis/PSS session builders
-   already calibrate at an arbitrary reference date — `doCalibrate`/`calibrate`);
-3. for the **Subscribed** mode, splices the user-supplied `[base, horizon]` segment with the
-   model-projected `(horizon, end]` segment at the horizon seam.
+#### 6B.4.1 Re-anchor inputs
 
-This replaces the bridge's per-`Bond`/per-`Run` horizon calibration caches
-(`ccBondCalibration_`/`prBondCalibration_`, `horizonSecondRateCalibCache_`) with a request-scoped
-builder plus the `DataAccessLayer` cache (once implemented) keyed by
-`(horizonDate, rateSource, model versions, market-data hash)`.
+| Input | Source | Purpose |
+|---|---|---|
+| Horizon date | `HorizonGenerationSpec::horizonDateSpec_` | The re-anchor reference date |
+| Horizon key/swap rates | `KeyRateProjector` (realized) or the prescribed `[base, horizon]` segment | Weighted swap (`wsr_base`) for basis/PSS calibration |
+| Horizon swaption vol | vol data shifted to the horizon (`HorizonScenarioUtils::applyHorizonShift`) | `vol_base` / vol-weighted terms |
+| Horizon HPI/unemployment | economic series shifted to the horizon (`prepareTimeSeriesMapForEcon`) | HPA/state inputs to the basis model |
+| Historical window ending at horizon | `HistoricalDataAccess` (shifted) | `anchorPrevious` / `extractHistoryDataFromContext` inputs |
+| (Prescribed) user calibration target | `prescribedHorizonRates_` + optional basis/primary overrides | What the re-solve matches |
+
+#### 6B.4.2 Calibration algorithm (per mortgage-rate / primary-rate type)
+
+1. **Build the horizon market snapshot.** At the horizon date, reconstruct the spot the models
+   calibrate against: weighted swap, vol level, and HPI/unemployment as-of the horizon. For the
+   **realized** mode these are read from the projected path at index `horizonMonths_`; for the
+   **prescribed** mode they are the final point of the supplied segment.
+
+2. **Re-solve the unexpected basis (secondary).** Reuse the secondary model's calibration entry
+   points — `StatisticalBasis::calibrate(...)` / `AdcoBasis::calibrate(...)` — which anchor
+   `TimeSliceVariables` at `T-1` relative to the horizon (`anchorPrevious`) and back-solve
+   `MarketSnapshot::unexpectedBasis_` to match the horizon snapshot (via
+   `setMortgageBasis`/`setUnexpectedBasis`). This is the `unexpBasisInputFlag_` analog for
+   user-supplied basis ([basis_model](.github/pando_context/pando_context/modules/basis_model.md)).
+
+3. **Re-solve the primary spread (PSS).** `AdcoPss::doCalibrate(...)` / `DynamicPss::doCalibrate(...)`
+   re-fit the `PssMarketSnapshot` (expected/unexpected spread, G-fee) against the horizon primary
+   rates or the user override
+   ([primary_rate_model](.github/pando_context/pando_context/modules/primary_rate_model.md)).
+
+4. **Rebuild sessions anchored at the horizon.** Construct `SecondaryMortgageRateModelSession` /
+   `PrimaryMortgageRateModelSession` with the session builders
+   (`StatisticalBasisSessionBuilder::extractHistoryDataFromContext` + `doBuild`, the PSS `doBuild`)
+   running against the horizon-shifted context — the
+   `BondValuation::buildSecondarySession` / `buildPrSession` analog.
+
+5. **Splice (prescribed mode).** Join the prescribed `[base, horizon]` segment to the projected
+   `(horizon, end]` segment; the projected segment starts from the horizon re-anchored snapshot so
+   the seam is continuous.
+
+The key semantic difference from T0 calibration: at T0 the models calibrate from *observed* market
+data; at the horizon they re-solve only the **residual** (`unexpectedBasis_` and the primary spread)
+against the *horizon snapshot* (or user input) — the expected-basis/trend/vol terms are recomputed
+from the horizon's historical window, not carried forward from T0.
+
+#### 6B.4.3 Skeleton
+
+```cpp
+struct HorizonCalibrationResult {
+    std::map<MortgageRateType, BasisSnapshot> secondary;    // ccBondCalibration_ analog
+    std::map<PrimaryRateType,  BasisSnapshot> primary;      // prBondCalibration_ analog
+    std::shared_ptr<SecondaryMortgageRateModelSession> secSession;
+    std::shared_ptr<PrimaryMortgageRateModelSession>   primSession;
+};
+
+class HorizonMarketSnapshotBuilder {
+public:
+    // horizonSpot: key rates as-of the horizon (projected index or prescribed end-point)
+    // horizonContext: horizon-shifted history / vol / HPI-unemployment
+    HorizonCalibrationResult build(
+        const HorizonGenerationSpec& horizon,
+        const RatePathsSet<KeyRate>& horizonSpot,
+        const wfmutil::context&      horizonContext);
+};
+```
+
+#### 6B.4.4 Caching
+
+`HorizonCalibrationResult` is request-scoped per horizon scenario. Cross-request caching (once the
+DAL cache exists) is keyed by
+`(horizonDate, rateSource, user scenario id, model versions, market-data hash)` — replacing
+`horizonSecondRateCalibCache_` / `horizonPrimaryRateCalibCache_`.
 
 ### 6B.5 Data Flow
 
 ```mermaid
 flowchart LR
-  S["HorizonGenerationSpec<br/>Subscribed | Realized"] --> HB["HorizonMarketSnapshotBuilder<br/>re-anchor basis/PSS at horizon"]
-  S -->|Subscribed| RDS["RateDataAccess<br/>[base, horizon] segment"]
+  S["HorizonGenerationSpec<br/>Prescribed | Realized"] --> HB["HorizonMarketSnapshotBuilder<br/>re-anchor basis/PSS at horizon"]
+  S -->|Prescribed| RDS["RateDataAccess<br/>[base, horizon] segment"]
   S -->|Realized| IR["KeyRateProjector<br/>full-path projection"]
   RDS --> HB
   IR --> HB
@@ -993,7 +1066,7 @@ suites treat horizon paths as ordinary scenarios.
 - **Distinct from month-end roll / waterfall** (owned by
   `MortgageValuationModelSuiteRedesign.md`): those loop over steps with fixed calibration; horizon
   analysis re-anchors calibration at a forward date.
-- **Splice seam parity (Subscribed):** the join between the prescribed `[base, horizon]` segment and
+- **Splice seam parity (Prescribed):** the join between the prescribed `[base, horizon]` segment and
   the projected `(horizon, end]` segment must be continuous at the horizon; golden-test against the
   bridge.
 - **RealizedFwd inputs:** fully model-generated SOFR paths need no new inputs, but a Treasury
@@ -1004,7 +1077,7 @@ suites treat horizon paths as ordinary scenarios.
 ### 6B.7 Migration
 
 1. Add `HorizonGenerationSpec` and `HorizonMarketSnapshotBuilder` (wrap `HorizonScenarioUtils`).
-2. Route subscribed segments through `RateDataAccess`; realized through the existing `KeyRateProjector`.
+2. Route prescribed segments through `RateDataAccess`; realized through the existing `KeyRateProjector`.
 3. Publish `intermediate["rates"]["horizon/..."]`; downstream suites need no changes.
 4. Golden parity against the `ppbridge` horizon outputs for `IpHorizon`/`WfhlHorizon` cases.
 
