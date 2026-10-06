@@ -28,16 +28,17 @@ need a volatility model.
 - **SOFR** = Secured Overnight Financing Rate: a backward-looking *overnight* rate computed from
   Treasury repo transactions, published on the next business day.
 - **Day count:** Act/360, so accrual over a period is $\Delta = \text{days}/360$.
-- **Compounding:** the floating leg of an OIS compounds daily SOFR over each accrual period:
-
-  $$
-  1 + \Delta_{\text{period}} \cdot R_{\text{period}} = \prod_{d \in \text{period}} \left(1 + \frac{r_d \cdot n_d}{360}\right)
-  $$
-
-  where $r_d$ is the SOFR fixing for day $d$ and $n_d$ is the number of calendar days that
-  rate applies (e.g., 3 over a weekend).
 - **No bank-credit term structure** (unlike old LIBOR): SOFR is a secured, near risk-free rate,
   so there is no "bank credit" premium baked in.
+
+**Compounding:** the floating leg of an OIS compounds daily SOFR over each accrual period:
+
+```math
+1 + \Delta_{\mathrm{period}} \cdot R_{\mathrm{period}} = \prod_{d \in \mathrm{period}} \left(1 + \frac{r_d \cdot n_d}{360}\right)
+```
+
+where $r_d$ is the SOFR fixing for day $d$ and $n_d$ is the number of calendar days that
+rate applies (e.g., 3 over a weekend).
 
 ---
 
@@ -49,10 +50,9 @@ A 3M SOFR future settles on the compounded SOFR over its reference quarter and i
 price $P = 100 - R$, where $R$ is the implied annualized rate (%). For the reference period
 $[T_1, T_2]$ with accrual $\Delta = (T_2-T_1)/360$, the futures-implied rate is $R$. It gives you:
 
-$$
-DF(T_2) = \frac{DF(T_1)}{1 + f\,\Delta}
-\qquad\text{where } f \approx R \text{ (before convexity adjustment)}
-$$
+```math
+DF(T_2) = \frac{DF(T_1)}{1 + f\,\Delta}, \qquad f \approx R \ \text{(before convexity adjustment)}
+```
 
 ### 3.2 OIS swaps: the long end
 
@@ -60,13 +60,12 @@ An OIS swap exchanges a **fixed rate $S_n$** against the **compounded SOFR** flo
 maturity $T_n$. At par (market convention), and assuming the same curve is used for projection
 and discounting, the fixed leg's present value equals the floating leg's:
 
-$$
-S_n \underbrace{\sum_{i=1}^{n} \Delta_i\,DF(T_i)}_{A_n \,=\, \text{annuity}}
-= 1 - DF(T_n)
-$$
+```math
+S_n \cdot A_n = 1 - DF(T_n), \qquad A_n = \sum_{i=1}^{n} \Delta_i \, DF(T_i)
+```
 
-The fixed rate $S_n$ is what the market quotes. The equation has one unknown, $DF(T_n)$, once
-all earlier $DF(T_i)$ are known.
+Here $A_n$ is the swap annuity. The fixed rate $S_n$ is what the market quotes. The equation has
+one unknown, $DF(T_n)$, once all earlier $DF(T_i)$ are known.
 
 ---
 
@@ -111,7 +110,11 @@ Values are computed at full precision and shown to 6 decimals.
 1. $DF(0.25) = \dfrac{1}{1 + 0.0175 \times 0.25} = 0.995644$
 2. $DF(0.50) = \dfrac{0.995644}{1 + 0.0200 \times 0.25} = 0.990691$
 3. $DF(0.75) = \dfrac{0.990691}{1 + 0.0190 \times 0.25} = 0.986007$
-4. $DF(1.00) = \dfrac{1 - 0.0210 \times 0.25\,(0.995644 + 0.990691 + 0.986007)}{1 + 0.0210 \times 0.25} = 0.979254$
+4. For the 1Y swap:
+
+```math
+DF(1.00) = \frac{1 - 0.0210 \times 0.25 \times (0.995644 + 0.990691 + 0.986007)}{1 + 0.0210 \times 0.25} = 0.979254
+```
 
 That's the entire algorithm: futures chain the short end, swaps extend the long end, and each
 step solves one number.
@@ -125,9 +128,9 @@ measure, while a forward rate is not. The futures-implied rate is therefore **hi
 true forward rate by a convexity bias. A common first-order correction (Ho-Lee / one-factor
 normal model, constant vol $\sigma$):
 
-$$
-f = R - \tfrac12\,\sigma^2\,T_1\,T_2
-$$
+```math
+f = R - \tfrac{1}{2}\,\sigma^2\,T_1\,T_2
+```
 
 In practice you estimate $\sigma$ from caplet/swaption vols or a Hull-White calibration. The bias
 is negligible for the first quarters but grows roughly with $T^2$. Skipping it biases forwards
@@ -173,10 +176,11 @@ The bootstrapped curve is a *discount* curve, but the secondary mortgage rate (b
 not consume $DF(t)$ directly. It consumes the **SOFR swap rates** that come out of the same IR
 model, because the current-coupon mortgage rate is modeled as
 
-$$
-r^{\text{mortgage}} = \underbrace{\text{weighted SOFR swap rate}}_{\text{WSR}} + \text{basis}
-$$
+```math
+r^{\mathrm{mortgage}} = \mathrm{WSR} + \mathrm{basis}
+```
 
+where $\mathrm{WSR}$ is the weighted SOFR swap rate
 ([basis_model](../../../.github/lib_context/lib_context/modules/basis_model.md)).
 
 ### 8.1 What "weighted SOFR swap" means
@@ -186,9 +190,9 @@ Each `MortgageRateType` (e.g. FN30 current coupon) has a set of `RateWeights` ex
 `determineRequiredIndices(types)`, which returns `KeyRate{SofrSwap, tenor}` indices, and forms the
 weighted swap:
 
-$$
-\mathrm{WSR}_t = \sum_{\text{tenor}} w_{\text{tenor}} \cdot r^{\text{SOFR swap}}_{\text{tenor},\,t}
-$$
+```math
+\mathrm{WSR}_t = \sum_{\mathrm{tenor}} w_{\mathrm{tenor}} \cdot r^{\mathrm{SOFR\ swap}}_{\mathrm{tenor},\,t}
+```
 
 `indexToWeight(keys, keyToWeight)` is the helper that maps those parameter-space tenors onto the IR
 model's actual SOFR swap-rate columns.
@@ -201,7 +205,7 @@ model's actual SOFR swap-rate columns.
 - **Projection:** `SecondaryMortgageRateModel::project(session, types, rates)` walks Monte-Carlo
   **SOFR swap-rate paths** and recomputes `weightedSwap` each step before adding the basis.
 - **Basis dynamics:** the *change* in the weighted swap drives the spread through the regression
-  term $\beta_{\text{wsr}}\,\Delta\mathrm{WSR}$ in `StatisticalBasis::unadjustedBasis`.
+  term $\beta_{\mathrm{wsr}}\,\Delta\mathrm{WSR}$ in `StatisticalBasis::unadjustedBasis`.
 
 ### 8.3 Two different SOFR roles (don't confuse them)
 
